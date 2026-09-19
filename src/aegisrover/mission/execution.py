@@ -1,19 +1,40 @@
 """Waypoint execution with geofence supervision.
 
-Two failure modes are covered here. A concave geofence must be evaluated against its
-real boundary — a sampling-only check between two points happily walks through the
-notch of an L-shaped exclusion zone. And a mission must not be reported as completed
-while waypoints are still outstanding, even if the operator presses "complete".
+Three failure modes are covered here. A concave geofence must be evaluated against
+its real boundary — a sampling-only check between two points happily walks through
+the notch of an L-shaped exclusion zone. A mission must not be reported as
+completed while waypoints are still outstanding, even if the operator presses
+"complete". And a crashed runner must not force the whole route to start over:
+progress used to live only in memory, so a fault halfway through the route threw
+away every waypoint already covered. :meth:`MissionExecution.checkpoint` captures
+the runner state behind a digest and :meth:`MissionExecution.restore` brings it
+back — but only against the exact plan that was checkpointed, so a mission whose
+route was edited in the meantime is restarted explicitly instead of silently
+flying the old line. Waypoints already consumed stay consumed, so resuming never
+double-counts the ground already covered.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
-__all__ = ('Geofence', 'WaypointRunner', 'MissionExecution', 'ExecutionError')
+from aegisrover.storage.repository import Repository, canonical_json
+
+__all__ = ('Geofence', 'WaypointRunner', 'MissionExecution', 'ExecutionError',
+           'ExecutionCheckpointStore', 'CHECKPOINT_NAMESPACE')
 
 Point = tuple[float, float]
+
+#: Repository namespace where durable execution checkpoints are stored.
+CHECKPOINT_NAMESPACE = 'execution_checkpoints'
+
+_CHECKPOINT_FIELDS = ('mission_id', 'state', 'index', 'skipped', 'events',
+                      'abort_reason', 'waypoints', 'tolerance', 'plan_digest',
+                      'sequence', 'digest')
+
+_STATES = ('idle', 'running', 'paused', 'completed', 'aborted')
 
 
 class ExecutionError(RuntimeError):
@@ -209,8 +230,120 @@ class MissionExecution:
                 'skipped': len(self.runner.skipped), 'events': len(self.events),
                 'abort_reason': self.abort_reason}
 
+    # -- checkpoint / restore ----------------------------------------------------
+    def checkpoint(self) -> dict:
+        """Digest-protected snapshot of everything needed to resume this run.
+
+        The snapshot pins the full waypoint plan and its digest so a restore can
+        prove the route has not changed underneath it. ``sequence`` is the event
+        count — it never decreases within a run — which lets a store reject a
+        stale checkpoint instead of rolling progress backwards.
+        """
+        body = {
+            'mission_id': self.mission_id,
+            'state': self.state,
+            'index': self.runner.index,
+            'skipped': [list(p) for p in self.runner.skipped],
+            'events': [dict(e) for e in self.events],
+            'abort_reason': self.abort_reason,
+            'waypoints': [list(w) for w in self.runner.waypoints],
+            'tolerance': self.runner.tolerance,
+            'sequence': len(self.events),
+        }
+        body['plan_digest'] = _plan_digest(self.runner.waypoints)
+        return {**body, 'digest': _checkpoint_digest(body)}
+
+    @staticmethod
+    def verify_checkpoint(checkpoint: dict) -> bool:
+        """True when the checkpoint carries every field and an intact digest."""
+        if not all(field in checkpoint for field in _CHECKPOINT_FIELDS):
+            return False
+        body = {k: v for k, v in checkpoint.items() if k != 'digest'}
+        return _checkpoint_digest(body) == checkpoint['digest']
+
+    @classmethod
+    def restore(cls, checkpoint: dict, *, waypoints: Sequence[Point] | None = None,
+                fence: 'Geofence | None' = None) -> 'MissionExecution':
+        """Rebuild an execution from :meth:`checkpoint`.
+
+        ``waypoints`` is the plan the mission holds *now*; when given, it must be
+        identical to the checkpointed plan. A mismatch means the route was edited
+        after the crash and the caller must restart explicitly — resuming onto a
+        different route would leave the flown trajectory disagreeing with the
+        plan. A runner checkpointed while ``running`` comes back ``paused`` so
+        resuming is an explicit decision.
+        """
+        if not isinstance(checkpoint, dict) or not cls.verify_checkpoint(checkpoint):
+            raise ExecutionError('checkpoint is missing fields or fails its digest')
+        if checkpoint['state'] not in _STATES:
+            raise ExecutionError(f"checkpoint has unknown state {checkpoint['state']!r}")
+        plan = tuple((float(x), float(y)) for x, y in checkpoint['waypoints'])
+        if _plan_digest(plan) != checkpoint['plan_digest']:
+            raise ExecutionError('checkpoint plan fails its digest')
+        if waypoints is not None and _plan_digest(waypoints) != checkpoint['plan_digest']:
+            raise ExecutionError('mission plan changed since the checkpoint; restart required')
+        index = int(checkpoint['index'])
+        if not 0 <= index <= len(plan):
+            raise ExecutionError('checkpoint index is outside the plan')
+        runner = WaypointRunner(
+            plan,
+            tolerance=float(checkpoint['tolerance']),
+            index=index,
+            skipped=[(float(x), float(y)) for x, y in checkpoint['skipped']],
+        )
+        state = 'paused' if checkpoint['state'] == 'running' else checkpoint['state']
+        return cls(checkpoint['mission_id'], runner, fence, state=state,
+                   events=[dict(e) for e in checkpoint['events']],
+                   abort_reason=checkpoint['abort_reason'])
+
     def _log(self, kind: str, payload: dict) -> None:
         self.events.append({'event': kind, **payload})
+
+
+class ExecutionCheckpointStore:
+    """Durable per-mission checkpoints on top of the versioned repository.
+
+    Saving is monotonic in the checkpoint sequence: an older snapshot (taken
+    before the latest save, e.g. flushed late by a dying process) is rejected
+    rather than allowed to roll the mission backwards.
+    """
+
+    def __init__(self, repository: Repository):
+        self._repo = repository
+
+    def save(self, execution: MissionExecution) -> dict:
+        checkpoint = execution.checkpoint()
+        existing = self._repo.maybe_get(CHECKPOINT_NAMESPACE, execution.mission_id)
+        if existing is not None and existing.payload['sequence'] > checkpoint['sequence']:
+            raise ExecutionError('refusing to overwrite a newer checkpoint')
+        self._repo.put(CHECKPOINT_NAMESPACE, execution.mission_id, checkpoint)
+        return checkpoint
+
+    def latest(self, mission_id: str) -> dict | None:
+        record = self._repo.maybe_get(CHECKPOINT_NAMESPACE, mission_id)
+        return None if record is None else dict(record.payload)
+
+    def restore(self, mission_id: str, *, waypoints: Sequence[Point] | None = None,
+                fence: 'Geofence | None' = None) -> MissionExecution | None:
+        """Resume ``mission_id`` from its latest checkpoint, or None if there is none."""
+        checkpoint = self.latest(mission_id)
+        if checkpoint is None:
+            return None
+        return MissionExecution.restore(checkpoint, waypoints=waypoints, fence=fence)
+
+    def discard(self, mission_id: str) -> None:
+        """Drop the checkpoint once the mission is finished with it."""
+        if self._repo.maybe_get(CHECKPOINT_NAMESPACE, mission_id) is not None:
+            self._repo.delete(CHECKPOINT_NAMESPACE, mission_id)
+
+
+def _plan_digest(waypoints: Sequence[Point]) -> str:
+    body = canonical_json([[float(x), float(y)] for x, y in waypoints])
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _checkpoint_digest(body: dict) -> str:
+    return hashlib.sha256(canonical_json(body).encode()).hexdigest()
 
 
 def _point_segment_distance(point: Point, a: Point, b: Point) -> float:

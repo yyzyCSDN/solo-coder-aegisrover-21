@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 
 from aegisrover.core.types import Pose2
 from aegisrover.estimation.filters import KalmanFilter, mahalanobis_squared
-from aegisrover.mission.execution import ExecutionError, Geofence, MissionExecution, WaypointRunner
+from aegisrover.mission.execution import (
+    ExecutionCheckpointStore, ExecutionError, Geofence, MissionExecution, WaypointRunner,
+)
 from aegisrover.power.charging import ChargingError, ChargingSession, DockAlignment, docking_error, is_aligned
 from aegisrover.power.energy import BatteryPack, DeratingCurve, budget, thermal_factor
 from aegisrover.sensors.fusion import Measurement, fit_calibration, fuse, align_series
@@ -172,6 +174,74 @@ def test_mission_execution_guards_completion_and_geofence():
     assert outside.state == 'aborted' and 'geofence' in outside.abort_reason
     with pytest.raises(ExecutionError):
         MissionExecution('m3', WaypointRunner([(1.0, 1.0)]), fence).start((20.0, 20.0))
+
+
+def test_mission_execution_resume_matches_uninterrupted_run():
+    waypoints = [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (10.0, 5.0)]
+    reference = MissionExecution('m1', WaypointRunner(waypoints, tolerance=0.5))
+    reference.start((0.0, 0.0))
+    for position in waypoints:
+        reference.tick(position)
+    assert reference.state == 'completed'
+
+    crashed = MissionExecution('m1', WaypointRunner(waypoints, tolerance=0.5))
+    crashed.start((0.0, 0.0))
+    crashed.tick((0.0, 0.0))
+    crashed.tick((5.0, 0.0))
+    saved = crashed.checkpoint()
+    assert MissionExecution.verify_checkpoint(saved)
+
+    restored = MissionExecution.restore(saved)
+    assert restored.state == 'paused'  # a crashed runner must be resumed explicitly
+    assert restored.runner.index == 2 and restored.runner.progress() == pytest.approx(0.5)
+    restored.resume()
+    restored.tick((0.0, 0.0))  # ground already covered: must not be consumed again
+    assert restored.runner.index == 2 and len(restored.events) == len(saved['events']) + 1
+    restored.tick((5.0, 5.0))
+    restored.tick((10.0, 5.0))
+    assert restored.state == 'completed'
+    hit = [e['index'] for e in restored.events if e['event'] == 'waypoint']
+    assert hit == [e['index'] for e in reference.events if e['event'] == 'waypoint'] == [1, 2, 3, 4]
+    assert restored.summary()['progress'] == 1.0
+
+
+def test_mission_execution_restore_rejects_changed_plan():
+    execution = MissionExecution('m1', WaypointRunner([(0.0, 0.0), (5.0, 0.0)], tolerance=0.5))
+    execution.start((0.0, 0.0))
+    execution.tick((0.0, 0.0))
+    saved = execution.checkpoint()
+    with pytest.raises(ExecutionError):
+        MissionExecution.restore(saved, waypoints=[(0.0, 0.0), (9.0, 9.0)])
+    restored = MissionExecution.restore(saved, waypoints=[(0.0, 0.0), (5.0, 0.0)])
+    assert restored.runner.index == 1 and restored.runner.tolerance == 0.5
+
+
+def test_mission_execution_restore_rejects_tampered_checkpoint():
+    execution = MissionExecution('m1', WaypointRunner([(0.0, 0.0), (5.0, 0.0)]))
+    execution.start((0.0, 0.0))
+    saved = execution.checkpoint()
+    with pytest.raises(ExecutionError):
+        MissionExecution.restore(dict(saved, index=2))
+    with pytest.raises(ExecutionError):
+        MissionExecution.restore({k: v for k, v in saved.items() if k != 'events'})
+
+
+def test_execution_checkpoint_store_roundtrip_and_stale_guard(repo):
+    store = ExecutionCheckpointStore(repo)
+    assert store.restore('m1') is None
+    execution = MissionExecution('m1', WaypointRunner([(0.0, 0.0), (5.0, 0.0)], tolerance=0.5))
+    execution.start((0.0, 0.0))
+    store.save(execution)
+    execution.tick((0.0, 0.0))
+    store.save(execution)
+
+    restored = store.restore('m1', waypoints=[(0.0, 0.0), (5.0, 0.0)])
+    assert restored.runner.index == 1 and restored.state == 'paused'
+    older = MissionExecution('m1', WaypointRunner([(0.0, 0.0), (5.0, 0.0)]))
+    with pytest.raises(ExecutionError):
+        store.save(older)  # a late flush from before the crash must not roll progress back
+    store.discard('m1')
+    assert store.latest('m1') is None
 
 
 # ------------------------------------------------------------------------------- power
